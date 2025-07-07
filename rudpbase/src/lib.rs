@@ -13,52 +13,34 @@
 //! 
 //! ## Usage
 //! 
-//! ### 推荐使用方式（内存池，零拷贝）
+//! ### 内存池方式（推荐）
 //! 
 //! ```rust
-//! use rudpbase::{Rudpbase, Buffer, RBuffer};
+//! use rudpbase::Rudpbase;
 //! use std::net::SocketAddr;
 //! 
 //! #[tokio::main]
 //! async fn main() -> Result<(), Box<dyn std::error::Error>> {
 //!     let mut rudp = Rudpbase::new("127.0.0.1:8080".parse()?).await?;
 //!     
-//!     // 发送数据（推荐方式：使用内存池）
+//!     // 发送数据（零拷贝方式）
 //!     let mut buffer = rudp.get_buffer()?;
 //!     let data = b"Hello, Rudpbase!";
 //!     buffer.data_mut()[..data.len()].copy_from_slice(data);
 //!     buffer.set_data_len(data.len())?;
-//!     rudp.write(buffer, "127.0.0.1:8081".parse()?).await?;
+//!     rudp.send(buffer, "127.0.0.1:8081".parse()?).await?;
 //!     
 //!     // 接收数据
-//!     if let Some(rbuffer) = rudp.poll_read().await {
-//!         match rbuffer.result {
+//!     if let Some(received) = rudp.recv().await {
+//!         match received.result {
 //!             Ok(buffer) => {
-//!                 println!("Received from {}: {:?}", rbuffer.from, buffer.buffer);
+//!                 println!("Received from {}: {:?}", received.from, buffer.data());
 //!             }
 //!             Err(e) => {
 //!                 println!("Receive error: {}", e);
 //!             }
 //!         }
 //!     }
-//!     
-//!     Ok(())
-//! }
-//! ```
-//! 
-//! ### 传统使用方式（兼容性API）
-//! 
-//! ```rust
-//! use rudpbase::{Rudpbase, Buffer, RBuffer};
-//! use std::net::SocketAddr;
-//! 
-//! #[tokio::main]
-//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     let mut rudp = Rudpbase::new("127.0.0.1:8080".parse()?).await?;
-//!     
-//!     // 发送数据（传统方式，需要数据拷贝）
-//!     let data = b"Hello, Rudpbase!";
-//!     rudp.write_bytes(data, "127.0.0.1:8081".parse()?).await?;
 //!     
 //!     Ok(())
 //! }
@@ -73,7 +55,7 @@ pub mod stats;
 pub mod security;
 pub mod buffer_pool;
 
-pub use core::{Rudpbase, Buffer, RBuffer, RPooledBuffer};
+pub use core::{Rudpbase, ReceivedData};
 pub use error::{RudpError, ConnectionError};
 pub use stats::{ConnectionStatus, ConnectionStats, RttStats};
 pub use protocol::{PacketType, PROTOCOL_HEADER_SIZE};

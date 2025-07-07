@@ -196,7 +196,7 @@ impl Rudpbase {
         
         // Store for retransmission
         let rto = self.rtt_stats.get(&target)
-            .map(|stats| stats.rto())
+            .map(|stats| stats.rto)
             .unwrap_or(Duration::from_millis(200));
         
         let pending_packet = PendingPacket::new(buffer.full_data().to_vec(), rto);
@@ -507,20 +507,24 @@ impl Rudpbase {
     }
 
     async fn send_pending_acks(&mut self) {
-        for (target, ack_seqs) in self.pending_acks.drain() {
-            if !ack_seqs.is_empty() {
-                let ack_packet = DataAckPacket::new(ack_seqs);
-                let seq = self.get_next_seq(target);
-                let security_code = SecurityCode::calculate(PacketType::DataAck, seq, &ack_packet.serialize());
-                
-                let packet = RawPacket {
-                    packet_type: PacketType::DataAck,
-                    security_code,
-                    seq,
-                    data: ack_packet.serialize(),
-                };
+        let targets: Vec<SocketAddr> = self.pending_acks.keys().cloned().collect();
+        
+        for target in targets {
+            if let Some(ack_seqs) = self.pending_acks.remove(&target) {
+                if !ack_seqs.is_empty() {
+                    let ack_packet = DataAckPacket::new(ack_seqs);
+                    let seq = self.get_next_seq(target);
+                    let security_code = SecurityCode::calculate(PacketType::DataAck, seq, &ack_packet.serialize());
+                    
+                    let packet = RawPacket {
+                        packet_type: PacketType::DataAck,
+                        security_code,
+                        seq,
+                        data: ack_packet.serialize(),
+                    };
 
-                let _ = self.socket.send_to(&packet.serialize(), target).await;
+                    let _ = self.socket.send_to(&packet.serialize(), target).await;
+                }
             }
         }
     }
@@ -551,14 +555,6 @@ impl Rudpbase {
                     if pending_packet.retry_count >= 5 {
                         // Max retries reached, mark for removal
                         addr_to_remove.push(*seq);
-                        
-                        // Update connection state
-                        if let Some(state) = self.connection_states.get_mut(addr) {
-                            state.mark_packet_lost();
-                        }
-                        
-                        // Update statistics
-                        self.connection_stats.entry(*addr).or_insert_with(ConnectionStats::new).record_packet_lost();
                     } else {
                         // Retry with exponential backoff
                         let new_rto = pending_packet.rto * 2;
@@ -587,13 +583,21 @@ impl Rudpbase {
         for addr in to_remove {
             self.send_buffer.remove(&addr);
         }
+        
+        // Update connection states for packet loss
+        for (addr, _) in &self.send_buffer {
+            if let Some(state) = self.connection_states.get_mut(addr) {
+                state.mark_packet_lost();
+            }
+            self.connection_stats.entry(*addr).or_insert_with(ConnectionStats::new).record_packet_lost();
+        }
     }
 
     async fn check_connection_health(&mut self, now: Instant) {
         let mut connections_to_ping = Vec::new();
         let mut connections_to_close = Vec::new();
 
-        for (addr, state) in &mut self.connection_states {
+        for (addr, state) in &self.connection_states {
             if state.should_ping(now) {
                 connections_to_ping.push(*addr);
             } else if state.should_close(now) {

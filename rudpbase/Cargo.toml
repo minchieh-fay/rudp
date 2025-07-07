@@ -1,0 +1,26 @@
+[package]
+name = "rudpbase"
+version = "0.1.0"
+edition = "2021"
+authors = ["Your Name <your.email@example.com>"]
+description = "A reliable UDP transmission library like TCP, focused on preventing packet loss without complex ordering"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/rudpbase"
+keywords = ["udp", "reliable", "network", "protocol", "rust"]
+categories = ["network-programming"]
+
+[dependencies]
+tokio = { version = "1.0", features = ["net", "time", "macros", "rt", "rt-multi-thread"] }
+fnv = "1.0"
+thiserror = "1.0"
+
+[dev-dependencies]
+tokio-test = "0.4"
+
+[lib]
+name = "rudpbase"
+path = "src/lib.rs"
+
+[[example]]
+name = "basic_usage"
+path = "examples/basic_usage.rs" 

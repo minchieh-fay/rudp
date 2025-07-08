@@ -5,7 +5,7 @@ use tokio::net::UdpSocket;
 use tokio::time;
 
 use crate::error::RudpError;
-use crate::stats::{ConnectionStats, ConnectionStatus, RttStats, ConnectionState};
+use crate::stats::{ConnectionStats, ConnectionStatus, RttStats, ConnectionState, CongestionInfo};
 use crate::protocol::{PacketType, RawPacket, PingPacket, DataAckPacket, DataNackPacket, MAX_BUFFER_SIZE};
 use crate::security::SecurityCode;
 use crate::buffer_pool::{SharedBufferPool, PooledBuffer, DEFAULT_INITIAL_CAPACITY};
@@ -19,10 +19,10 @@ pub struct ReceivedData {
 }
 
 /// Pending packet structure for retransmission
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct PendingPacket {
-    /// Packet data
-    data: Vec<u8>,
+    /// Packet buffer (holds the actual memory from pool)
+    buffer: PooledBuffer,
     /// Send timestamp
     send_time: Instant,
     /// Retry count
@@ -32,9 +32,9 @@ struct PendingPacket {
 }
 
 impl PendingPacket {
-    fn new(data: Vec<u8>, rto: Duration) -> Self {
+    fn new(buffer: PooledBuffer, rto: Duration) -> Self {
         Self {
-            data,
+            buffer,
             send_time: Instant::now(),
             retry_count: 0,
             rto,
@@ -49,6 +49,11 @@ impl PendingPacket {
         self.retry_count += 1;
         self.send_time = Instant::now();
         self.rto = rto;
+    }
+
+    /// 获取完整的数据包内容（包含协议头）
+    fn packet_data(&self) -> &[u8] {
+        self.buffer.full_data()
     }
 }
 
@@ -160,13 +165,16 @@ impl Rudpbase {
     /// 
     /// 这是零拷贝的发送方法，直接使用预分配的buffer
     /// 
+    /// **重要**: 此方法包含拥塞控制，如果当前拥塞窗口已满，会返回错误
+    /// 
     /// # 参数
     /// - `buffer`: 包含数据的内存池buffer
     /// - `target`: 目标地址
     /// 
     /// # 返回
     /// - `Ok(())`: 发送成功
-    /// - `Err(RudpError)`: 发送失败
+    /// - `Err(RudpError::CongestionWindowFull)`: 拥塞窗口已满，请稍后重试
+    /// - `Err(RudpError)`: 其他发送失败原因
     /// 
     /// # 使用示例
     /// ```rust,no_run
@@ -182,28 +190,41 @@ impl Rudpbase {
     ///     buffer.data_mut()[..data.len()].copy_from_slice(data);
     ///     buffer.set_data_len(data.len())?;
     ///     
-    ///     // 发送
+    ///     // 发送（可能因拥塞窗口满而失败）
     ///     let target_addr = "127.0.0.1:8081".parse().unwrap();
-    ///     rudp.send(buffer, target_addr).await?;
+    ///     match rudp.send(buffer, target_addr).await {
+    ///         Ok(()) => println!("发送成功"),
+    ///         Err(rudpbase::RudpError::CongestionWindowFull) => {
+    ///             println!("拥塞窗口已满，请稍后重试");
+    ///             // 可以等待一段时间后重试，或者调用tick()处理ACK
+    ///         }
+    ///         Err(e) => println!("发送失败: {}", e),
+    ///     }
     ///     Ok(())
     /// }
     /// ```
     pub async fn send(&mut self, mut buffer: PooledBuffer, target: SocketAddr) -> Result<(), RudpError> {
+        // 检查拥塞窗口
+        let rtt_stats = self.rtt_stats.entry(target).or_insert_with(RttStats::new);
+        if !rtt_stats.can_send() {
+            return Err(RudpError::CongestionWindowFull);
+        }
+        
         let seq = self.get_next_seq(target);
         
         // Fill protocol header
         buffer.fill_protocol_header(PacketType::Data, seq)?;
         
-        // Store for retransmission
-        let rto = self.rtt_stats.get(&target)
-            .map(|stats| stats.rto)
-            .unwrap_or(Duration::from_millis(200));
-        
-        let pending_packet = PendingPacket::new(buffer.full_data().to_vec(), rto);
-        self.send_buffer.entry(target).or_insert_with(HashMap::new).insert(seq, pending_packet);
-        
-        // Send packet
+        // Send packet first
         self.socket.send_to(buffer.full_data(), target).await?;
+        
+        // Update congestion control (packet sent)
+        self.rtt_stats.get_mut(&target).unwrap().on_packet_sent();
+        
+        // Store for retransmission (after sending)
+        let rto = self.rtt_stats.get(&target).unwrap().rto;
+        let pending_packet = PendingPacket::new(buffer, rto);
+        self.send_buffer.entry(target).or_insert_with(HashMap::new).insert(seq, pending_packet);
         
         // Update statistics
         self.connection_stats.entry(target).or_insert_with(ConnectionStats::new).record_packet_sent();
@@ -313,6 +334,20 @@ impl Rudpbase {
     /// Get connection statistics
     pub fn get_stats(&self, addr: SocketAddr) -> Option<ConnectionStats> {
         self.connection_stats.get(&addr).cloned()
+    }
+
+    /// 获取连接的拥塞控制状态
+    /// 
+    /// 返回指定地址的拥塞窗口大小、飞行中包数量等信息
+    pub fn get_congestion_info(&self, addr: SocketAddr) -> Option<CongestionInfo> {
+        self.rtt_stats.get(&addr).map(|stats| CongestionInfo {
+            congestion_window: stats.cwnd,
+            slow_start_threshold: stats.ssthresh,
+            in_flight_packets: stats.in_flight,
+            available_window: stats.available_window(),
+            congestion_state: stats.congestion_state.clone(),
+            current_rto: stats.rto,
+        })
     }
 
     // Private helper methods
@@ -425,7 +460,9 @@ impl Rudpbase {
                     if let Some(pending_packet) = pending_packets.remove(&ack_seq) {
                         // Calculate RTT and update statistics
                         let rtt = Instant::now().duration_since(pending_packet.send_time);
-                        self.rtt_stats.entry(from).or_insert_with(RttStats::new).update(rtt);
+                        let rtt_stats = self.rtt_stats.entry(from).or_insert_with(RttStats::new);
+                        rtt_stats.update_rtt(rtt);
+                        rtt_stats.on_ack_received(1);
                         self.connection_stats.entry(from).or_insert_with(ConnectionStats::new).update_rtt(rtt);
                     }
                 }
@@ -439,7 +476,7 @@ impl Rudpbase {
                 if let Some(pending_packets) = self.send_buffer.get_mut(&from) {
                     if let Some(pending_packet) = pending_packets.get_mut(&nack_seq) {
                         // Immediate retransmission for NACK
-                        let _ = self.socket.send_to(&pending_packet.data, from).await;
+                        let _ = self.socket.send_to(&pending_packet.buffer.full_data(), from).await;
                         pending_packet.retry_count += 1;
                         pending_packet.send_time = Instant::now();
                         
@@ -470,7 +507,9 @@ impl Rudpbase {
             let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos() as u64;
             if now > ping_packet.timestamp {
                 let rtt = Duration::from_nanos(now - ping_packet.timestamp);
-                self.rtt_stats.entry(from).or_insert_with(RttStats::new).update(rtt);
+                                        let rtt_stats = self.rtt_stats.entry(from).or_insert_with(RttStats::new);
+                        rtt_stats.update_rtt(rtt);
+                        rtt_stats.on_ack_received(1);
                 self.connection_stats.entry(from).or_insert_with(ConnectionStats::new).update_rtt(rtt);
             }
         }
@@ -560,10 +599,13 @@ impl Rudpbase {
                         let new_rto = pending_packet.rto * 2;
                         pending_packet.retry(new_rto);
                         
-                        let _ = self.socket.send_to(&pending_packet.data, *addr).await;
+                        let _ = self.socket.send_to(&pending_packet.buffer.full_data(), *addr).await;
                         
                         // Update statistics
                         self.connection_stats.entry(*addr).or_insert_with(ConnectionStats::new).record_retransmission();
+                        
+                        // Update congestion control for packet loss
+                        self.rtt_stats.entry(*addr).or_insert_with(RttStats::new).on_packet_lost();
                     }
                 }
             }

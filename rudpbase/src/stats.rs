@@ -76,72 +76,146 @@ impl ConnectionStats {
     }
 }
 
-/// RTT (Round Trip Time) statistics using standard TCP algorithm
+/// RTT统计和拥塞控制
 #[derive(Debug, Clone)]
 pub struct RttStats {
-    /// Smoothed RTT
-    pub rtt: Duration,
-    /// RTT variation
-    pub rtt_var: Duration,
-    /// Retransmission timeout
+    /// 平滑RTT
+    pub srtt: Duration,
+    /// RTT变化量
+    pub rttvar: Duration,
+    /// 重传超时时间
     pub rto: Duration,
+    /// 拥塞窗口（以包为单位）
+    pub cwnd: u32,
+    /// 慢启动阈值
+    pub ssthresh: u32,
+    /// 当前飞行中的包数量
+    pub in_flight: u32,
+    /// 最后一次拥塞事件时间
+    pub last_congestion: Option<Instant>,
+    /// 拥塞控制状态
+    pub congestion_state: CongestionState,
+}
+
+/// 拥塞控制状态
+#[derive(Debug, Clone, PartialEq)]
+pub enum CongestionState {
+    /// 慢启动阶段
+    SlowStart,
+    /// 拥塞避免阶段
+    CongestionAvoidance,
+    /// 快速恢复阶段
+    FastRecovery,
 }
 
 impl RttStats {
     pub fn new() -> Self {
         Self {
-            rtt: Duration::from_millis(200),     // Initial RTT estimate
-            rtt_var: Duration::from_millis(100), // Initial RTT variation
-            rto: Duration::from_millis(200),     // Initial RTO
+            srtt: Duration::from_millis(100),
+            rttvar: Duration::from_millis(50),
+            rto: Duration::from_millis(200),
+            cwnd: 1,  // 初始拥塞窗口为1
+            ssthresh: 65535,  // 初始慢启动阈值设为最大值
+            in_flight: 0,
+            last_congestion: None,
+            congestion_state: CongestionState::SlowStart,
         }
     }
 
-    /// Update RTT statistics with a new measurement
-    /// Uses standard TCP RTT algorithm:
-    /// RTT = 7/8 * RTT + 1/8 * new_measurement
-    /// RTT_VAR = 3/4 * RTT_VAR + 1/4 * |RTT - new_measurement|
-    /// RTO = RTT + 4 * RTT_VAR
-    pub fn update(&mut self, measurement: Duration) {
-        let measurement_ns = measurement.as_nanos() as u64;
-        let rtt_ns = self.rtt.as_nanos() as u64;
-        let rtt_var_ns = self.rtt_var.as_nanos() as u64;
+    /// 更新RTT统计
+    pub fn update_rtt(&mut self, rtt_sample: Duration) {
+        const ALPHA: f64 = 0.125;
+        const BETA: f64 = 0.25;
+        const K: u32 = 4;
+        const G: Duration = Duration::from_millis(10);
 
-        if self.rtt == Duration::from_millis(200) {
-            // First measurement
-            self.rtt = measurement;
-            self.rtt_var = Duration::from_nanos(measurement_ns / 2);
-        } else {
-            // Update RTT: RTT = 7/8 * RTT + 1/8 * measurement
-            let new_rtt_ns = (rtt_ns * 7 + measurement_ns) / 8;
-            self.rtt = Duration::from_nanos(new_rtt_ns);
+        let rtt_sample_ms = rtt_sample.as_millis() as f64;
+        let srtt_ms = self.srtt.as_millis() as f64;
+        let rttvar_ms = self.rttvar.as_millis() as f64;
 
-            // Update RTT_VAR: RTT_VAR = 3/4 * RTT_VAR + 1/4 * |RTT - measurement|
-            let diff = if measurement_ns > new_rtt_ns {
-                measurement_ns - new_rtt_ns
-            } else {
-                new_rtt_ns - measurement_ns
-            };
-            let new_rtt_var_ns = (rtt_var_ns * 3 + diff) / 4;
-            self.rtt_var = Duration::from_nanos(new_rtt_var_ns);
+        // 更新RTTVAR
+        let new_rttvar_ms = (1.0 - BETA) * rttvar_ms + BETA * (srtt_ms - rtt_sample_ms).abs();
+        self.rttvar = Duration::from_millis(new_rttvar_ms as u64);
+
+        // 更新SRTT
+        let new_srtt_ms = (1.0 - ALPHA) * srtt_ms + ALPHA * rtt_sample_ms;
+        self.srtt = Duration::from_millis(new_srtt_ms as u64);
+
+        // 计算RTO
+        let rto_ms = new_srtt_ms + (K as f64 * new_rttvar_ms).max(G.as_millis() as f64);
+        self.rto = Duration::from_millis(rto_ms.min(60000.0).max(200.0) as u64);
+    }
+
+    /// 包发送时调用（增加飞行中包数量）
+    pub fn on_packet_sent(&mut self) {
+        self.in_flight += 1;
+    }
+
+    /// 收到ACK时调用（拥塞控制）
+    pub fn on_ack_received(&mut self, acked_packets: u32) {
+        self.in_flight = self.in_flight.saturating_sub(acked_packets);
+        
+        match self.congestion_state {
+            CongestionState::SlowStart => {
+                // 慢启动：每个ACK增加1个包
+                self.cwnd += acked_packets;
+                
+                // 检查是否超过慢启动阈值
+                if self.cwnd >= self.ssthresh {
+                    self.congestion_state = CongestionState::CongestionAvoidance;
+                }
+            }
+            CongestionState::CongestionAvoidance => {
+                // 拥塞避免：每个RTT增加1个包
+                // 近似实现：每收到cwnd个ACK增加1个包
+                self.cwnd += acked_packets.max(1) / self.cwnd.max(1);
+            }
+            CongestionState::FastRecovery => {
+                // 快速恢复阶段，暂时不调整窗口
+            }
         }
+        
+        // 限制最大窗口大小
+        self.cwnd = self.cwnd.min(1000);
+    }
 
-        // Update RTO: RTO = RTT + 4 * RTT_VAR
-        let rto_ns = self.rtt.as_nanos() as u64 + 4 * self.rtt_var.as_nanos() as u64;
-        self.rto = Duration::from_nanos(rto_ns);
-
-        // Clamp RTO to reasonable bounds
-        if self.rto < Duration::from_millis(200) {
-            self.rto = Duration::from_millis(200);
-        } else if self.rto > Duration::from_secs(3) {
-            self.rto = Duration::from_secs(3);
+    /// 检测到丢包时调用
+    pub fn on_packet_lost(&mut self) {
+        let now = Instant::now();
+        
+        // 避免在短时间内多次触发拥塞控制
+        if let Some(last) = self.last_congestion {
+            if now.duration_since(last) < self.rto {
+                return;
+            }
+        }
+        
+        self.last_congestion = Some(now);
+        
+        // 设置慢启动阈值为当前窗口的一半
+        self.ssthresh = (self.cwnd / 2).max(2);
+        
+        match self.congestion_state {
+            CongestionState::SlowStart | CongestionState::CongestionAvoidance => {
+                // 进入快速恢复或直接降低窗口
+                self.cwnd = self.ssthresh;
+                self.congestion_state = CongestionState::CongestionAvoidance;
+            }
+            CongestionState::FastRecovery => {
+                // 已经在快速恢复中，进一步降低窗口
+                self.cwnd = (self.cwnd / 2).max(1);
+            }
         }
     }
 
-    /// Get current RTO with exponential backoff
-    pub fn get_rto(&self, retry_count: u8) -> Duration {
-        let base_rto = self.rto.as_millis() as u64;
-        let backoff_rto = base_rto * (1u64 << retry_count.min(5)); // Cap at 2^5 = 32x
-        Duration::from_millis(backoff_rto.min(3000)) // Max 3 seconds
+    /// 检查是否可以发送新包（窗口控制）
+    pub fn can_send(&self) -> bool {
+        self.in_flight < self.cwnd
+    }
+
+    /// 获取当前可发送的包数量
+    pub fn available_window(&self) -> u32 {
+        self.cwnd.saturating_sub(self.in_flight)
     }
 }
 
@@ -217,6 +291,23 @@ impl ConnectionState {
     pub fn mark_packet_lost(&mut self) {
         self.status = ConnectionStatus::Degraded;
     }
+}
+
+/// 拥塞控制信息
+#[derive(Debug, Clone)]
+pub struct CongestionInfo {
+    /// 拥塞窗口大小（以包为单位）
+    pub congestion_window: u32,
+    /// 慢启动阈值
+    pub slow_start_threshold: u32,
+    /// 当前飞行中的包数量
+    pub in_flight_packets: u32,
+    /// 可用窗口大小
+    pub available_window: u32,
+    /// 拥塞控制状态
+    pub congestion_state: CongestionState,
+    /// 当前RTO
+    pub current_rto: Duration,
 }
 
 // Constants for connection management

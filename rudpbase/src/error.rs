@@ -27,6 +27,9 @@ pub enum RudpError {
     
     #[error("Timeout error")]
     Timeout,
+    
+    #[error("Congestion window is full, cannot send more packets")]
+    CongestionWindowFull,
 }
 
 /// Connection-specific errors
@@ -46,6 +49,12 @@ pub enum ConnectionError {
     
     #[error("Connection reset by peer {addr}")]
     Reset { addr: SocketAddr },
+    
+    #[error("Connection closed by peer")]
+    Closed,
+    
+    #[error("Too many retransmissions")]
+    TooManyRetries,
 }
 
 /// Error severity levels for handling different types of errors
@@ -71,6 +80,7 @@ impl RudpError {
             RudpError::InternalError => ErrorSeverity::Critical,
             RudpError::PacketTooSmall { .. } => ErrorSeverity::Recoverable,
             RudpError::Timeout => ErrorSeverity::Degraded,
+            RudpError::CongestionWindowFull => ErrorSeverity::Degraded,
         }
     }
 }
@@ -84,6 +94,8 @@ impl ConnectionError {
             ConnectionError::MaxRetriesExceeded { .. } => ErrorSeverity::Critical,
             ConnectionError::Degraded { .. } => ErrorSeverity::Degraded,
             ConnectionError::Reset { .. } => ErrorSeverity::Critical,
+            ConnectionError::Closed => ErrorSeverity::Critical,
+            ConnectionError::TooManyRetries => ErrorSeverity::Critical,
         }
     }
 } 

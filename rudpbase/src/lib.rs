@@ -56,11 +56,11 @@ pub mod security;
 pub mod buffer_pool;
 
 pub use core::{Rudpbase, ReceivedData};
-pub use error::{RudpError, ConnectionError};
-pub use stats::{ConnectionStatus, ConnectionStats, RttStats};
+pub use error::{RudpError, ConnectionError, ErrorSeverity};
+pub use stats::{ConnectionStatus, ConnectionStats, RttStats, ConnectionState, CongestionInfo, CongestionState};
 pub use protocol::{PacketType, PROTOCOL_HEADER_SIZE};
 pub use security::SecurityCode;
-pub use buffer_pool::*;
+pub use buffer_pool::{PooledBuffer, SharedBufferPool, PoolStats};
 
 /// Create a new Rudpbase instance
 /// 

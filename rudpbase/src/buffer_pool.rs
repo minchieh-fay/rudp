@@ -19,6 +19,7 @@ pub const DEFAULT_INITIAL_CAPACITY: usize = 500;
 /// |<-- header_size -->|<-- user data area -->|
 /// 
 /// 用户只能访问数据区，协议头由rudpbase内部填充
+#[derive(Debug)]
 pub struct PooledBuffer {
     /// 完整的buffer（包含协议头空间）
     raw_buffer: Vec<u8>,
@@ -155,6 +156,7 @@ impl Drop for PooledBuffer {
 /// 
 /// 管理固定大小的buffer块，支持高效的分配和回收
 /// 所有buffer块大小固定为 DEFAULT_BUFFER_SIZE
+#[derive(Debug)]
 pub struct BufferPool {
     /// 空闲buffer队列
     free_buffers: VecDeque<Vec<u8>>,
